@@ -3,12 +3,30 @@
 
 import { GetObjectCommand, PutObjectCommand, S3Client } from "@aws-sdk/client-s3";
 import Sharp from 'sharp';
+import { trace, SpanStatusCode } from '@opentelemetry/api';
 
 const s3Client = new S3Client();
 const S3_ORIGINAL_IMAGE_BUCKET = process.env.originalImageBucketName;
 const S3_TRANSFORMED_IMAGE_BUCKET = process.env.transformedImageBucketName;
 const TRANSFORMED_IMAGE_CACHE_TTL = process.env.transformedImageCacheTTL;
 const MAX_IMAGE_SIZE = parseInt(process.env.maxImageSize);
+// No-op unless the OpenTelemetry SDK is registered (ADOT Lambda layer enabled with ENABLE_OTEL)
+const tracer = trace.getTracer('image-optimization');
+
+// Run fn inside a child span, recording exceptions and the span status
+async function withSpan(name, attributes, fn) {
+    return tracer.startActiveSpan(name, { attributes }, async (span) => {
+        try {
+            return await fn(span);
+        } catch (error) {
+            span.recordException(error);
+            span.setStatus({ code: SpanStatusCode.ERROR, message: error.message });
+            throw error;
+        } finally {
+            span.end();
+        }
+    });
+}
 
 export const handler = async (event) => {
     // Validate if this is a GET request
@@ -20,6 +38,7 @@ export const handler = async (event) => {
     // get the original image path images/rio/1.jpg
     imagePathArray.shift();
     var originalImagePath = imagePathArray.join('/');
+    trace.getActiveSpan()?.setAttributes({ 'image.path': originalImagePath, 'image.operations': operationsPrefix });
 
     var startTime = performance.now();
     // Downloading original image
@@ -27,18 +46,21 @@ export const handler = async (event) => {
     let contentType;
     try {
         const getOriginalImageCommand = new GetObjectCommand({ Bucket: S3_ORIGINAL_IMAGE_BUCKET, Key: originalImagePath });
-        const getOriginalImageCommandOutput = await s3Client.send(getOriginalImageCommand);
-        console.log(`Got response from S3 for ${originalImagePath}`);
+        await withSpan('image.download', { 'image.path': originalImagePath }, async (span) => {
+            const getOriginalImageCommandOutput = await s3Client.send(getOriginalImageCommand);
+            console.log(`Got response from S3 for ${originalImagePath}`);
 
-        originalImageBody = getOriginalImageCommandOutput.Body.transformToByteArray();
-        contentType = getOriginalImageCommandOutput.ContentType;
+            originalImageBody = await getOriginalImageCommandOutput.Body.transformToByteArray();
+            contentType = getOriginalImageCommandOutput.ContentType;
+            span.setAttributes({ 'image.original.size': originalImageBody.byteLength, 'image.original.content_type': contentType });
+        });
     } catch (error) {
         if (error.name === "NoSuchKey") {
           return sendError(404, "The requested image does not exist", error);
         }
         return sendError(500, 'Error downloading original image', error);
     }
-    let transformedImage = Sharp(await originalImageBody, { failOn: 'none', animated: true });
+    let transformedImage = Sharp(originalImageBody, { failOn: 'none', animated: true });
     // Get image orientation to rotate if needed
     const imageMetadata = await transformedImage.metadata();
     // execute the requested operations 
@@ -47,34 +69,37 @@ export const handler = async (event) => {
     var timingLog = 'img-download;dur=' + parseInt(performance.now() - startTime);
     startTime = performance.now();
     try {
-        // check if resizing is requested
-        var resizingOptions = {};
-        if (operationsJSON['width']) resizingOptions.width = parseInt(operationsJSON['width']);
-        if (operationsJSON['height']) resizingOptions.height = parseInt(operationsJSON['height']);
-        if (resizingOptions) transformedImage = transformedImage.resize(resizingOptions);
-        // check if rotation is needed
-        if (imageMetadata.orientation) transformedImage = transformedImage.rotate();
-        // check if formatting is requested
-        if (operationsJSON['format']) {
-            var isLossy = false;
-            switch (operationsJSON['format']) {
-                case 'jpeg': contentType = 'image/jpeg'; isLossy = true; break;
-                case 'gif': contentType = 'image/gif'; break;
-                case 'webp': contentType = 'image/webp'; isLossy = true; break;
-                case 'png': contentType = 'image/png'; break;
-                case 'avif': contentType = 'image/avif'; isLossy = true; break;
-                default: contentType = 'image/jpeg'; isLossy = true;
+        await withSpan('image.transform', { 'image.operations': operationsPrefix }, async (span) => {
+            // check if resizing is requested
+            var resizingOptions = {};
+            if (operationsJSON['width']) resizingOptions.width = parseInt(operationsJSON['width']);
+            if (operationsJSON['height']) resizingOptions.height = parseInt(operationsJSON['height']);
+            if (resizingOptions) transformedImage = transformedImage.resize(resizingOptions);
+            // check if rotation is needed
+            if (imageMetadata.orientation) transformedImage = transformedImage.rotate();
+            // check if formatting is requested
+            if (operationsJSON['format']) {
+                var isLossy = false;
+                switch (operationsJSON['format']) {
+                    case 'jpeg': contentType = 'image/jpeg'; isLossy = true; break;
+                    case 'gif': contentType = 'image/gif'; break;
+                    case 'webp': contentType = 'image/webp'; isLossy = true; break;
+                    case 'png': contentType = 'image/png'; break;
+                    case 'avif': contentType = 'image/avif'; isLossy = true; break;
+                    default: contentType = 'image/jpeg'; isLossy = true;
+                }
+                if (operationsJSON['quality'] && isLossy) {
+                    transformedImage = transformedImage.toFormat(operationsJSON['format'], {
+                        quality: parseInt(operationsJSON['quality']),
+                    });
+                } else transformedImage = transformedImage.toFormat(operationsJSON['format']);
+            } else {
+                /// If not format is precised, Sharp converts svg to png by default https://github.com/aws-samples/image-optimization/issues/48
+                if (contentType === 'image/svg+xml') contentType = 'image/png';
             }
-            if (operationsJSON['quality'] && isLossy) {
-                transformedImage = transformedImage.toFormat(operationsJSON['format'], {
-                    quality: parseInt(operationsJSON['quality']),
-                });
-            } else transformedImage = transformedImage.toFormat(operationsJSON['format']);
-        } else {
-            /// If not format is precised, Sharp converts svg to png by default https://github.com/aws-samples/image-optimization/issues/48
-            if (contentType === 'image/svg+xml') contentType = 'image/png';
-        }
-        transformedImage = await transformedImage.toBuffer();
+            transformedImage = await transformedImage.toBuffer();
+            span.setAttributes({ 'image.transformed.size': transformedImage.byteLength, 'image.transformed.content_type': contentType });
+        });
     } catch (error) {
         return sendError(500, 'error transforming image', error);
     }
@@ -94,7 +119,7 @@ export const handler = async (event) => {
                 ContentType: contentType,
                 CacheControl: TRANSFORMED_IMAGE_CACHE_TTL,
             })
-            await s3Client.send(putImageCommand);
+            await withSpan('image.upload', { 'image.key': originalImagePath + '/' + operationsPrefix }, () => s3Client.send(putImageCommand));
             timingLog = timingLog + ',img-upload;dur=' + parseInt(performance.now() - startTime);
             // If the generated image file is too big, send a redirection to the generated image on S3, instead of serving it synchronously from Lambda. 
             if (imageTooBig) {

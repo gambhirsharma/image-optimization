@@ -28,6 +28,13 @@ var LAMBDA_MEMORY = '1500';
 var LAMBDA_TIMEOUT = '60';
 // Whether to deploy a sample website referenced in https://aws.amazon.com/blogs/networking-and-content-delivery/image-optimization-using-amazon-cloudfront-and-aws-lambda/
 var DEPLOY_SAMPLE_WEBSITE = 'false';
+// OpenTelemetry parameters. When enabled, the image processing Lambda is instrumented with the AWS Distro for
+// OpenTelemetry (ADOT) Lambda layer, and traces are sent to AWS X-Ray / CloudWatch Application Signals.
+var ENABLE_OTEL = 'false';
+// ARN of the ADOT Node.js Lambda layer. Layer versions are published per region, check the latest version in
+// https://docs.aws.amazon.com/AmazonCloudWatch/latest/monitoring/CloudWatch-Application-Signals-Enable-Lambda.html
+var OTEL_LAYER_ARN: string;
+var OTEL_SERVICE_NAME = 'image-optimization';
 
 type ImageDeliveryCacheBehaviorConfig = {
   origin: any;
@@ -43,6 +50,8 @@ type LambdaEnv = {
   transformedImageBucketName?: any;
   transformedImageCacheTTL: string,
   maxImageSize: string,
+  AWS_LAMBDA_EXEC_WRAPPER?: string,
+  OTEL_SERVICE_NAME?: string,
 }
 
 export class ImageOptimizationStack extends Stack {
@@ -60,6 +69,9 @@ export class ImageOptimizationStack extends Stack {
     LAMBDA_TIMEOUT = this.node.tryGetContext('LAMBDA_TIMEOUT') || LAMBDA_TIMEOUT;
     MAX_IMAGE_SIZE = this.node.tryGetContext('MAX_IMAGE_SIZE') || MAX_IMAGE_SIZE;
     DEPLOY_SAMPLE_WEBSITE = this.node.tryGetContext('DEPLOY_SAMPLE_WEBSITE') || DEPLOY_SAMPLE_WEBSITE;
+    ENABLE_OTEL = this.node.tryGetContext('ENABLE_OTEL') || ENABLE_OTEL;
+    OTEL_LAYER_ARN = this.node.tryGetContext('OTEL_LAYER_ARN') || `arn:aws:lambda:${this.region}:615299751070:layer:AWSOpenTelemetryDistroJs:14`;
+    OTEL_SERVICE_NAME = this.node.tryGetContext('OTEL_SERVICE_NAME') || OTEL_SERVICE_NAME;
     
 
     // deploy a sample website for testing if required
@@ -140,6 +152,11 @@ export class ImageOptimizationStack extends Stack {
       maxImageSize: MAX_IMAGE_SIZE,
     };
     if (transformedImageBucket) lambdaEnv.transformedImageBucketName = transformedImageBucket.bucketName;
+    if (ENABLE_OTEL === 'true') {
+      // the ADOT layer wrapper bootstraps the OpenTelemetry SDK before the handler is loaded
+      lambdaEnv.AWS_LAMBDA_EXEC_WRAPPER = '/opt/otel-instrument';
+      lambdaEnv.OTEL_SERVICE_NAME = OTEL_SERVICE_NAME;
+    }
 
     // IAM policy to read from the S3 bucket containing the original images
     const s3ReadOriginalImagesPolicy = new iam.PolicyStatement({
@@ -151,7 +168,7 @@ export class ImageOptimizationStack extends Stack {
     var iamPolicyStatements = [s3ReadOriginalImagesPolicy];
 
     // Create Lambda for image processing
-    var lambdaProps = {
+    var lambdaProps: lambda.FunctionProps = {
       runtime: lambda.Runtime.NODEJS_24_X,
       handler: 'index.handler',
       code: lambda.Code.fromAsset('functions/image-processing'),
@@ -160,9 +177,20 @@ export class ImageOptimizationStack extends Stack {
       environment: lambdaEnv,
       logGroup: new logs.LogGroup(this, 'MyFunctionLogGroup', {
           retention: logs.RetentionDays.ONE_DAY,
-        })
+        }),
+      ...(ENABLE_OTEL === 'true' && {
+        tracing: lambda.Tracing.ACTIVE,
+        layers: [lambda.LayerVersion.fromLayerVersionArn(this, 'otel-layer', OTEL_LAYER_ARN)],
+      }),
     };
     var imageProcessing = new lambda.Function(this, 'image-optimization', lambdaProps);
+
+    // allow the ADOT layer to publish traces and Application Signals metrics
+    if (ENABLE_OTEL === 'true') {
+      imageProcessing.role?.addManagedPolicy(
+        iam.ManagedPolicy.fromAwsManagedPolicyName('CloudWatchLambdaApplicationSignalsExecutionRolePolicy'),
+      );
+    }
 
     // Enable Lambda URL
     const imageProcessingURL = imageProcessing.addFunctionUrl();
